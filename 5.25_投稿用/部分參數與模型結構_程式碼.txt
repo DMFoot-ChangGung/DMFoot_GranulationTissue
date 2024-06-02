@@ -1,0 +1,106 @@
+# 超參數
+
+queue_size_set = 2
+scale_ratio = 1
+net_version = "net_ResUnet_V1_F16"
+classprefix = net_version
+subimage_size = 1024
+batch_size = 10
+batch_size_old = batch_size
+batch_size_ingraph = 1
+reapeat_time = 1
+label_scale = 1
+sample_scale = 1
+train_sample = 32870
+test_sample = 1338
+label_channel = 2
+sample_channel = 3
+sample_channel_in_net = 4
+fc_2_node = 8000
+conv_base = 16
+restore_step = 0
+P0 = 0
+substart = time.time()
+origin_data_path = "./test_origin"
+label_data_path = "./train_label"
+test_data_path = "./test_origin"
+test_label_data_path = "./test_label"
+KEEP_PROB_SET = 0.8
+
+
+
+# 模型結構
+
+def ResUnet_Encoder_Block(inputs, n_filters=conv_base, dropout_prob=KEEP_PROB_SET, max_pooling=True):
+	conv = tf.layers.Conv2D(n_filters,3,activation='relu',padding='same',kernel_initializer=tf.keras.initializers.he_normal())(inputs)	
+	conv = tf.layers.BatchNormalization()(conv, training=False)	
+	conv = tf.layers.Conv2D(n_filters,3,activation='relu',padding='same',kernel_initializer=tf.keras.initializers.he_normal())(conv)  
+	conv = tf.layers.BatchNormalization()(conv, training=False)
+	if dropout_prob > 0:     
+		conv = tf.layers.Dropout(dropout_prob)(conv)	
+	shortcut = tf.layers.Conv2D(n_filters, (1, 1), padding='same')(inputs)
+	shortcut = tf.layers.BatchNormalization()(shortcut, training=False)	
+	conv =	conv+shortcut	
+	if max_pooling:
+		next_layer = tf.layers.AveragePooling2D(pool_size = (2,2),strides = 2)(conv)    
+	else:
+		next_layer = conv	
+	skip_connection = conv    
+	return next_layer, skip_connection
+
+def ResUnet_Decoder_Block(prev_layer_input, skip_layer_input, n_filters=conv_base):
+    up = tf.layers.Conv2DTranspose(n_filters,(3,3),strides=(2,2),padding='same')(prev_layer_input)
+    merge = tf.concat([up, skip_layer_input], axis=3)
+    conv = tf.layers.Conv2D(n_filters,3,activation='relu',padding='same',kernel_initializer=tf.keras.initializers.he_normal())(merge)
+    conv = tf.layers.Conv2D(n_filters,3,activation='relu',padding='same',kernel_initializer=tf.keras.initializers.he_normal())(conv)
+    shortcut = tf.layers.Conv2D(n_filters, (1, 1), padding='same')(merge)
+    shortcut = tf.layers.BatchNormalization()(shortcut, training=False)
+    conv = conv + shortcut	
+    return conv
+
+with tf.device('/device:GPU:0'):
+    with tf.variable_scope("U-net"):
+        n_filters = conv_base
+        n_classes = label_channel
+        cblock1 = ResUnet_Encoder_Block(x_image, n_filters, dropout_prob=0, max_pooling=True)
+        cblock2 = ResUnet_Encoder_Block(cblock1[0], n_filters * 2, dropout_prob=0, max_pooling=True)
+        cblock3 = ResUnet_Encoder_Block(cblock2[0], n_filters * 4, dropout_prob=0, max_pooling=True)
+        cblock4 = ResUnet_Encoder_Block(cblock3[0], n_filters * 8, dropout_prob=0.3, max_pooling=True)
+        cblock5 = ResUnet_Encoder_Block(cblock4[0], n_filters * 16, dropout_prob=0.3, max_pooling=False)
+        ublock6 = ResUnet_Decoder_Block(cblock5[0], cblock4[1], n_filters * 8)
+        ublock7 = ResUnet_Decoder_Block(ublock6, cblock3[1], n_filters * 4)
+        ublock8 = ResUnet_Decoder_Block(ublock7, cblock2[1], n_filters * 2)
+        ublock9 = ResUnet_Decoder_Block(ublock8, cblock1[1], n_filters)
+        conv9 = tf.layers.Conv2D(n_filters, (3, 3), activation='elu', padding='same', kernel_initializer=tf.keras.initializers.he_normal())(ublock9)
+        conv9_BM = conv9
+        conv10 = tf.layers.Conv2D(n_classes, (3, 3), activation='tanh', padding='same', kernel_initializer=tf.keras.initializers.he_normal())(conv9_BM)
+        prediction = tf.transpose(conv10, [0, 3, 1, 2])
+
+with tf.device('/device:CPU:0'):
+    prediction_2 = tf.reshape(prediction, [-1, label_channel, subimage_size // label_scale, subimage_size // label_scale])
+    with tf.variable_scope("sys_loss"):
+        split_x0, split_x1 = tf.split(prediction_2, [1, 1], axis=1)
+        split_y0, split_y1, split_y2, split_y3, split_y4, split_y5, split_y6 = tf.split(ys, [1, 1, 1, 1, 1, 1, 1], axis=1)
+        split_x0_CCR1 = tf.squeeze(split_x0, 1)
+        split_x1_CCR1 = tf.squeeze(split_x1, 1)
+        split_y0_CCR1 = tf.squeeze(split_y0, 1)
+        split_y1_CCR1 = tf.squeeze(split_y1, 1)
+        split_y5_CCR1 = tf.squeeze(split_y5, 1)
+        split_y6_CCR1 = tf.squeeze(split_y6, 1)
+        y_MSE_CCR1 = tf.sqrt(tf.reduce_sum(tf.square(split_x0_CCR1 - split_y0_CCR1))) / (subimage_size // label_scale)
+        MSE2 = tf.reduce_mean(tf.square(split_x1_CCR1 - split_y1_CCR1)) * tf.constant(0.3)
+        MSE3 = tf.reduce_mean(tf.square(split_x0_CCR1 - split_y0_CCR1)) * tf.constant(0.7)
+        MSE_loss = tf.reduce_mean(MSE2 + MSE3)
+    with tf.variable_scope("corr_coeff"):
+        pearson_r = tf.reduce_sum((split_y0_CCR1 - tf.reduce_mean(split_y0_CCR1)) * (split_x0_CCR1 - tf.reduce_mean(split_x0_CCR1))) / tf.sqrt(
+            tf.reduce_sum(tf.square(split_y0_CCR1 - tf.reduce_mean(split_y0_CCR1))) * tf.reduce_sum(tf.square(split_x0_CCR1 - tf.reduce_mean(split_x0_CCR1))))
+    with tf.variable_scope("AUC"):
+        split_y5_CCR1 = tf.cast(split_y5_CCR1, tf.bool)
+        split_y6_CCR1 = tf.cast(split_y6_CCR1, tf.bool)
+        split_x0_bool = tf.cast(split_x0_CCR1, tf.bool)
+        label_mask = tf.equal(split_y6_CCR1, split_x0_bool)
+        split_y6_CCR1 = tf.boolean_mask(split_y6_CCR1, label_mask)
+        split_y5_CCR1 = tf.boolean_mask(split_y5_CCR1, label_mask)
+        split_x0_bool = tf.boolean_mask(split_x0_bool, label_mask)
+        split_y6_CCR1 = tf.boolean_mask(split_y6_CCR1, label_mask)
+        auc = tf.metrics.auc(split_y6_CCR1, split_x0_bool)
